@@ -15,16 +15,88 @@
 #ifdef PLASMA_WITH_CUDA
 #if PLASMA_WITH_HPCASIA24
 #include <cublas_v2.h>
+#include <cuda_runtime.h>
 
 #include <Eigen/Dense>
+#include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <fstream>
 #include <limits>
 
 #include "common.h"
 #include "cuda_fp8.h"
 #include "mixed_precision.h"
 #include "plasma_d_mixed.h"
+#include "mx_emulation.h"
+#include "mx_apply.h"
+#include "ladder_selection.h"
 
+static std::string bucket_format(const char *env_name) {
+  if (const char *env = getenv(env_name)) {
+    std::string fmt = env;
+    std::transform(fmt.begin(), fmt.end(), fmt.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return fmt;
+  }
+  return {};
+}
+
+static bool is_device_or_managed(const void *p) {
+  if (!p) return false;
+  cudaPointerAttributes attr;
+  if (cudaPointerGetAttributes(&attr, p) != cudaSuccess) return false;
+  return attr.type == cudaMemoryTypeDevice || attr.type == cudaMemoryTypeManaged;
+}
+
+static const char *dtype_to_string(int dtype) {
+  switch (dtype) {
+    case CUDA_R_64F:
+      return "fp64";
+    case CUDA_R_32F:
+      return "fp32";
+    case CUDA_R_16F:
+      return "fp16";
+    case CUDA_R_16BF:
+      return "bf16";
+    case CUDA_R_8F_E4M3:
+      return "fp8_e4m3";
+    default:
+      return "unknown";
+  }
+}
+
+struct QuantWorkspace {
+  float *d_in = nullptr;
+  float *d_out = nullptr;
+  float *d_max = nullptr;
+  size_t capacity = 0;  // elements
+  size_t max_capacity = 0;  // max-values elements
+};
+
+static QuantWorkspace g_quant_ws;
+// External linkage: incremented from mx_apply.h's templated tile-quant
+// functions too, not just this file.
+size_t g_pinned_bytes = 0;
+size_t g_pinned_tiles = 0;
+static size_t g_quant_ws_bytes = 0;
+
+static void ensureQuantWorkspace(size_t elems, size_t max_elems) {
+  if (g_quant_ws.capacity >= elems && g_quant_ws.max_capacity >= max_elems) {
+    return;
+  }
+  if (g_quant_ws.d_in) {
+    cudaFree(g_quant_ws.d_in);
+    cudaFree(g_quant_ws.d_out);
+    cudaFree(g_quant_ws.d_max);
+  }
+  g_quant_ws.capacity = elems;
+  g_quant_ws.max_capacity = max_elems;
+  cudaMalloc(reinterpret_cast<void **>(&g_quant_ws.d_in), elems * sizeof(float));
+  cudaMalloc(reinterpret_cast<void **>(&g_quant_ws.d_out), elems * sizeof(float));
+  cudaMalloc(reinterpret_cast<void **>(&g_quant_ws.d_max), max_elems * sizeof(float));
+  g_quant_ws_bytes = elems * sizeof(float) * 2 + max_elems * sizeof(float);
+}
 #define FMULS_POTRF_ULL(__n) (__n * __n / 2 * (__n / 3 + 1) + __n / 3)
 #define FADDS_POTRF_ULL(__n) (__n * ((__n * __n - 1) / 6))
 #define FLOPS_DPOTRF_ULL(__n) (FMULS_POTRF_ULL((__n)) + FADDS_POTRF_ULL((__n)))
@@ -90,83 +162,154 @@ void makeMixedPrecisionTiledArray(MixedPrecisionTiledArray *array,
                                   const int uplo, const double *data,
                                   const size_t m, const size_t n,
                                   const size_t ld, const size_t nb) {
-  array->nb = nb;
-  array->mb = nb;
-  array->m = array->n = n;
-  array->nt = ((long)n - 1) / nb + 1;
-  array->tiles = new MixedPrecisionTile[array->nt * array->nt];
-  Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic>,
-             Eigen::Unaligned, Eigen::Stride<Eigen::Dynamic, 1>>
+
+  g_pinned_tiles = 0;
+  g_pinned_bytes = 0;
+
+    array->nb = nb;
+    array->mb = nb;
+    array->m = array->n = n;
+    array->nt = ((long)n - 1) / nb + 1;
+    array->tiles = new MixedPrecisionTile[array->nt * array->nt]();
+
+    Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic>,
+           Eigen::Unaligned, Eigen::Stride<Eigen::Dynamic, 1>>
       mappedA{data,
-              static_cast<Eigen::Index>(m),
-              static_cast<Eigen::Index>(n),
-              {static_cast<Eigen::Index>(ld), 1}};
-  long double normA = mappedA.norm();
-  array->uplo = uplo;
-  cudaDeviceProp deviceProp;
-  cudaGetDeviceProperties_v2(&deviceProp, 0);
-  const bool hasFp8 = deviceProp.major >= 9;
-  if (uplo == PlasmaLower) {
-    for (int row = 0; row < array->nt; ++row) {
-      for (int col = 0; col <= row; ++col) {
-        auto &tile = array->tiles[col + row * array->nt];
-        size_t nbRow = row == array->nt - 1 ? array->m - row * nb : nb;
-        size_t nbCol = col == array->nt - 1 ? array->n - col * nb : nb;
-        tile.m = nbRow;
-        tile.n = nbCol;
-        tile.ld = nbCol;
-        tile.layout = CblasRowMajor;
-        auto mappedBlock = mappedA.block(row * nb, col * nb, nbRow, nbCol);
-        long double normTile = mappedBlock.norm();
-        auto epsilonRatio = array->nt * normTile / normA;
-        // auto sourceEpsilon = std::numeric_limits<double>::epsilon();
-        long double sourceEpsilon = 0;
-        if (row == col ||
-            epsilonRatio >
-                sourceEpsilon / std::numeric_limits<float>::epsilon()) {
-          tile.dtype = CUDA_R_64F;
-          cudaMallocHost(&tile.data, sizeof(uint64_t) * tile.m * tile.n);
-          Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic,
-                                   Eigen::RowMajor>>{
+          static_cast<Eigen::Index>(m),
+          static_cast<Eigen::Index>(n),
+          {static_cast<Eigen::Index>(ld), 1}};
+
+    long double normA = mappedA.norm();
+    array->uplo = uplo;
+
+    // Real native FP8 hardware requires compute capability >= 9
+    // (Hopper+). On anything older (e.g. this A100), FP8 tiles must be
+    // emulated instead (mx_apply::quant_plain_fp_tile) -- see the low
+    // tier of Baseline's dispatch below.
+    cudaDeviceProp deviceProp;
+    cudaGetDeviceProperties_v2(&deviceProp, 0);
+    const bool hasFp8 = deviceProp.major >= 9;
+
+    // Assuming CUDA headers are included:
+    if (uplo == PlasmaLower) {
+      for (int row = 0; row < array->nt; ++row) {
+        for (int col = 0; col <= row; ++col) {
+          auto &tile = array->tiles[col + row * array->nt];
+          size_t nbRow = row == array->nt - 1 ? array->m - row * nb : nb;
+          size_t nbCol = col == array->nt - 1 ? array->n - col * nb : nb;
+          tile.m = nbRow;
+          tile.n = nbCol;
+          tile.ld = nbCol;
+          tile.layout = CblasRowMajor;       
+          auto mappedBlock = mappedA.block(row * nb, col * nb, nbRow, nbCol);
+          long double normTile = mappedBlock.norm();
+          auto epsilonRatio = array->nt * normTile / normA;
+
+          const long double sourceEpsilon = []() {
+            const char *env = getenv("MX_SOURCE_EPSILON");
+            if (!env || !env[0]) {
+              return static_cast<long double>(
+                  std::numeric_limits<float>::epsilon());
+            }
+            char *end = nullptr;
+            const long double v = std::strtold(env, &end);
+            if (end == env || *end != '\0' || !(v > 0.0L)) {
+              std::cout << "[WARN] Invalid MX_SOURCE_EPSILON='" << env
+                        << "', using default float epsilon." << std::endl;
+              return static_cast<long double>(
+                  std::numeric_limits<float>::epsilon());
+            }
+            return v;
+          }();
+          // Baseline's low tier is always plain FP8_E4M3 (apply_plain_fp_quant,
+          // no MX block scale) -- Baseline isn't an MX mode, so it no longer
+          // reads an MX-named env var to decide this; it's just how Baseline
+          // is defined. MX_SELECTION_CRITERIA=bound bypasses this whole
+          // heuristic anyway for the 3 ladder modes (see ladder_selection.h).
+          constexpr bool allow_low = true;
+          const std::string fp32_bucket = bucket_format("MX_BUCKET_FP32");
+          const std::string fp16_bucket = bucket_format("MX_BUCKET_FP16");
+          // fp8_e4m3 has no MX shared scale, so its unit roundoff needs no
+          // scale-aware underflow term -- format_unit_roundoff("fp8_e4m3")
+          // is the whole story.
+          const long double lowCutoff =
+              sourceEpsilon / format_unit_roundoff("fp8_e4m3");
+
+          // Thin forwarders into mx_apply.h -- the real quantization logic
+          // lives there, templated on the Eigen expression type of
+          // mappedBlock. Kept as same-named local lambdas so every call
+          // site below reads exactly as it did before the split. (Only
+          // apply_plain_fp_quant, log_tile_target, and apply_bucket_target
+          // are still used here -- baseline's low tier is fixed to plain
+          // FP8_E4M3; the ladder modes call mx_apply:: directly from
+          // ladder_selection.h instead of through these.)
+          auto apply_plain_fp_quant = [&](const char *label, int ebits, int mbits,
+                                          float max_norm) {
+            mx_apply::quant_plain_fp_tile(tile, row, col, mappedBlock, label, ebits, mbits, max_norm);
+          };
+          auto log_tile_target = [&](const char *target) {
+            mx_apply::log_tile_target(row, col, target);
+          };
+          auto apply_bucket_target = [&](const std::string &bucket,
+                                         const char *fallback) {
+            mx_apply::apply_bucket(bucket, fallback, tile, row, col, mappedBlock);
+          };
+
+          if (row == col ) {
+            tile.dtype = CUDA_R_64F;
+            cudaMallocHost(&tile.data, sizeof(uint64_t) * tile.m * tile.n);
+            g_pinned_tiles++;
+            g_pinned_bytes += sizeof(uint64_t) * tile.m * tile.n;
+            Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic,
+                         Eigen::RowMajor>>{
               static_cast<double *>(tile.data),
               static_cast<Eigen::Index>(tile.m),
               static_cast<Eigen::Index>(tile.n)} = mappedBlock.cast<double>();
-        } else if (epsilonRatio >
-                   sourceEpsilon /
-                       std::numeric_limits<Eigen::half>::epsilon()) {
-          tile.dtype = CUDA_R_32F;
-          cudaMallocHost(&tile.data, sizeof(uint32_t) * tile.m * tile.n);
-          Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic,
-                                   Eigen::RowMajor>>{
-              static_cast<float *>(tile.data),
-              static_cast<Eigen::Index>(tile.m),
-              static_cast<Eigen::Index>(tile.n)} = mappedBlock.cast<float>();
-        } else if (!hasFp8 ||
-                   epsilonRatio >
-                       sourceEpsilon * 16 /* 1/16 is the epsilon of fp8 */) {
-          tile.dtype = CUDA_R_16F;
-          cudaMallocHost(&tile.data, sizeof(uint16_t) * tile.m * tile.n);
-          Eigen::Map<Eigen::Matrix<Eigen::half, Eigen::Dynamic, Eigen::Dynamic,
-                                   Eigen::RowMajor>>{
-              static_cast<Eigen::half *>(tile.data),
-              static_cast<Eigen::Index>(tile.m),
-              static_cast<Eigen::Index>(tile.n)} =
-              mappedBlock.cast<Eigen::half>();
-        } else {
-          tile.dtype = CUDA_R_8F_E4M3;
-          cudaMallocHost(&tile.data, sizeof(uint8_t) * tile.m * tile.n);
-          Eigen::Map<Eigen::Matrix<__nv_fp8_e4m3, Eigen::Dynamic,
-                                   Eigen::Dynamic, Eigen::RowMajor>>{
-              static_cast<__nv_fp8_e4m3 *>(tile.data),
-              static_cast<Eigen::Index>(tile.m),
-              static_cast<Eigen::Index>(tile.n)} =
-              mappedBlock.cast<__nv_fp8_e4m3>();
+            log_tile_target("fp64");
+            std::cout << "[TILE_DTYPE] (" << row << ", " << col << ") "
+                      << dtype_to_string(tile.dtype) << std::endl;
+            continue;
+          }
+
+          if (mx_ladder::selection_criteria_is_bound()) {
+            // Ladder IEEE / Ladder MX / Ladder MX+MXFP16 in the paper's
+            // naming -- see compute/ladder_selection.h.
+            mx_ladder::run(tile, row, col, mappedBlock, sourceEpsilon, normA,
+                           normTile, array->nt, fp32_bucket, fp16_bucket);
+          } else if (epsilonRatio > sourceEpsilon / std::numeric_limits<float>::epsilon()) {
+            log_tile_target("fp64");
+            tile.dtype = CUDA_R_64F;
+            cudaMallocHost(&tile.data, sizeof(uint64_t) * tile.m * tile.n);
+            Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic,
+                                    Eigen::RowMajor>>{
+                static_cast<double *>(tile.data),
+                static_cast<Eigen::Index>(tile.m),
+                static_cast<Eigen::Index>(tile.n)} = mappedBlock.cast<double>();
+          } else if (epsilonRatio > sourceEpsilon / std::numeric_limits<Eigen::half>::epsilon()) {
+            std::cout << "---------------- Tile (" << row << ", " << col
+                        << ") selected for CUDA_R_32F -------------------"
+                        << std::endl;
+            apply_bucket_target(fp32_bucket, "fp32");
+          } else if (!allow_low ||
+                     epsilonRatio > lowCutoff) {
+            apply_bucket_target(fp16_bucket, "fp16");
+          } else if (hasFp8) {
+            // Native hardware FP8 (Hopper+) -- no emulation needed.
+            log_tile_target("fp8_e4m3");
+            mx_apply::store_native_fp8_e4m3_tile(tile, mappedBlock);
+          } else {
+            // No native FP8 on this GPU (e.g. this A100) -- emulate it.
+            log_tile_target("fp8_e4m3");
+            apply_plain_fp_quant("FP8_E4M3", 4, 3, 448.0f);
+          }
+
+          std::cout << "[TILE_DTYPE] (" << row << ", " << col << ") "
+                    << dtype_to_string(tile.dtype) << std::endl;
         }
       }
+    } else {
+      std::cout << "Only Lower matrix is supported so far" << std::endl;
     }
-  } else {
-    printf("Only Lower matrix is supported so far\n");
-  }
 }
 
 void uncompressMixedPrecisionTiledArray(const MixedPrecisionTiledArray *array,
@@ -183,53 +326,104 @@ void uncompressMixedPrecisionTiledArray(const MixedPrecisionTiledArray *array,
         const auto &tile = array->tiles[col + row * array->nt];
         auto mappedBlock =
             mappedA.block(row * array->nb, col * array->nb, tile.m, tile.n);
+        // If tile data is on device/managed, stage to host for the map.
+        bool deviceTile = is_device_or_managed(tile.data);
         switch (tile.dtype) {
-          case CUDA_R_64F:
+          case CUDA_R_64F: {
+            const double *src = static_cast<const double *>(tile.data);
+            std::vector<double> hostBuf;
+            const double *hostPtr = src;
+            if (deviceTile) {
+              hostBuf.resize(tile.m * tile.n);
+              cudaMemcpy(hostBuf.data(), src, tile.m * tile.n * sizeof(double),
+                         cudaMemcpyDeviceToHost);
+              hostPtr = hostBuf.data();
+            }
             mappedBlock = Eigen::Map<const Eigen::Matrix<
                 double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>{
-                static_cast<double *>(tile.data),
-                static_cast<Eigen::Index>(tile.m),
+                hostPtr, static_cast<Eigen::Index>(tile.m),
                 static_cast<Eigen::Index>(tile.n)};
             break;
-          case CUDA_R_32F:
+          }
+          case CUDA_R_32F: {
+            const float *src = static_cast<const float *>(tile.data);
+            std::vector<float> hostBuf;
+            const float *hostPtr = src;
+            if (deviceTile) {
+              hostBuf.resize(tile.m * tile.n);
+              cudaMemcpy(hostBuf.data(), src, tile.m * tile.n * sizeof(float),
+                         cudaMemcpyDeviceToHost);
+              hostPtr = hostBuf.data();
+            }
             mappedBlock =
                 Eigen::Map<const Eigen::Matrix<
                     float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>{
-                    static_cast<float *>(tile.data),
-                    static_cast<Eigen::Index>(tile.m),
+                    hostPtr, static_cast<Eigen::Index>(tile.m),
                     static_cast<Eigen::Index>(tile.n)}
                     .cast<double>();
             break;
-          case CUDA_R_16F:
+          }
+          case CUDA_R_16F: {
+            const Eigen::half *src = static_cast<const Eigen::half *>(tile.data);
+            std::vector<Eigen::half> hostBuf;
+            const Eigen::half *hostPtr = src;
+            if (deviceTile) {
+              hostBuf.resize(tile.m * tile.n);
+              cudaMemcpy(hostBuf.data(), src, tile.m * tile.n * sizeof(Eigen::half),
+                         cudaMemcpyDeviceToHost);
+              hostPtr = hostBuf.data();
+            }
             mappedBlock =
                 Eigen::Map<
                     const Eigen::Matrix<Eigen::half, Eigen::Dynamic,
                                         Eigen::Dynamic, Eigen::RowMajor>>{
-                    static_cast<Eigen::half *>(tile.data),
-                    static_cast<Eigen::Index>(tile.m),
+                    hostPtr, static_cast<Eigen::Index>(tile.m),
                     static_cast<Eigen::Index>(tile.n)}
                     .cast<double>();
             break;
-          case CUDA_R_16BF:
+          }
+          case CUDA_R_16BF: {
+            const Eigen::bfloat16 *src =
+                static_cast<const Eigen::bfloat16 *>(tile.data);
+            std::vector<Eigen::bfloat16> hostBuf;
+            const Eigen::bfloat16 *hostPtr = src;
+            if (deviceTile) {
+              hostBuf.resize(tile.m * tile.n);
+              cudaMemcpy(hostBuf.data(), src,
+                         tile.m * tile.n * sizeof(Eigen::bfloat16),
+                         cudaMemcpyDeviceToHost);
+              hostPtr = hostBuf.data();
+            }
             mappedBlock =
                 Eigen::Map<
                     const Eigen::Matrix<Eigen::bfloat16, Eigen::Dynamic,
                                         Eigen::Dynamic, Eigen::RowMajor>>{
-                    static_cast<Eigen::bfloat16 *>(tile.data),
-                    static_cast<Eigen::Index>(tile.m),
+                    hostPtr, static_cast<Eigen::Index>(tile.m),
                     static_cast<Eigen::Index>(tile.n)}
                     .cast<double>();
             break;
-          case CUDA_R_8F_E4M3:
+          }
+          case CUDA_R_8F_E4M3: {
+            const __nv_fp8_e4m3 *src =
+                static_cast<const __nv_fp8_e4m3 *>(tile.data);
+            std::vector<__nv_fp8_e4m3> hostBuf;
+            const __nv_fp8_e4m3 *hostPtr = src;
+            if (deviceTile) {
+              hostBuf.resize(tile.m * tile.n);
+              cudaMemcpy(hostBuf.data(), src,
+                         tile.m * tile.n * sizeof(__nv_fp8_e4m3),
+                         cudaMemcpyDeviceToHost);
+              hostPtr = hostBuf.data();
+            }
             mappedBlock =
                 Eigen::Map<
                     const Eigen::Matrix<__nv_fp8_e4m3, Eigen::Dynamic,
                                         Eigen::Dynamic, Eigen::RowMajor>>{
-                    static_cast<__nv_fp8_e4m3 *>(tile.data),
-                    static_cast<Eigen::Index>(tile.m),
+                    hostPtr, static_cast<Eigen::Index>(tile.m),
                     static_cast<Eigen::Index>(tile.n)}
                     .cast<double>();
             break;
+          }
           default:
             printf("Wrong datatype in %s:%d\n", __FILE__, __LINE__);
             break;
@@ -278,7 +472,12 @@ void freeMixedPrecisionTiledArray(MixedPrecisionTiledArray *array) {
     for (int row = 0; row < array->nt; ++row) {
       for (int col = 0; col <= row; ++col) {
         auto &tile = array->tiles[col + row * array->nt];
-        CHECK_CUDA(cudaFreeHost(tile.data));
+        if (!tile.data) continue;
+        if (is_device_or_managed(tile.data)) {
+          CHECK_CUDA(cudaFree(tile.data));
+        } else {
+          CHECK_CUDA(cudaFreeHost(tile.data));
+        }
       }
     }
   } else {
@@ -286,6 +485,21 @@ void freeMixedPrecisionTiledArray(MixedPrecisionTiledArray *array) {
   }
 
   delete[] array->tiles;
+
+  if (g_quant_ws.capacity) {
+    cudaFree(g_quant_ws.d_in);
+    cudaFree(g_quant_ws.d_out);
+    cudaFree(g_quant_ws.d_max);
+    g_quant_ws = {};
+  }
+}
+
+// Real logic lives in mx_apply.h (mx_apply::requantize_tile_host) alongside
+// quant_mx_tile/quant_plain_fp_tile -- kept as a thin forwarder here since
+// control/mixed_precision.h declares this exact global name, callable from
+// pdpotrf_gpu_mixed_precision.cpp.
+void requantizeTileHost(const MixedPrecisionTile *tile) {
+  mx_apply::requantize_tile_host(tile);
 }
 
 size_t getSizeofTileElement(int dtype) {
@@ -402,7 +616,7 @@ int PLASMA_dpotrf_gpu_reuse_data_mixed_precision(PLASMA_enum uplo, int N,
   plasma_context_t *plasma;
   PLASMA_sequence *sequence = NULL;
   PLASMA_request request = PLASMA_REQUEST_INITIALIZER;
-
+  printf("Starting PLASMA_dpotrf_gpu_reuse_data_mixed_precision...\n");
   plasma = plasma_context_self();
   if (plasma == NULL) {
     plasma_fatal_error("PLASMA_dpotrf", "PLASMA not initialized");
@@ -432,12 +646,15 @@ int PLASMA_dpotrf_gpu_reuse_data_mixed_precision(PLASMA_enum uplo, int N,
   }
 
   /* Set NT */
-  NB = PLASMA_NB;
+  NB = (plasma->autotuning_enabled ? PLASMA_NB : plasma->nb);
 
   plasma_sequence_create(plasma, &sequence);
 
   MixedPrecisionTiledArray array;
+  printf("Making mixed-precision tiled array...\n");
+  auto t0 = std::chrono::high_resolution_clock::now();
   makeMixedPrecisionTiledArray(&array, uplo, A, N, N, LDA, NB);
+  auto t1 = std::chrono::high_resolution_clock::now();
 
   //    if ( PLASMA_TRANSLATION == PLASMA_OUTOFPLACE ) {
   //        plasma_dooplap2tile( descA, A, NB, NB, LDA, N, 0, 0, N, N, sequence,
@@ -455,13 +672,34 @@ int PLASMA_dpotrf_gpu_reuse_data_mixed_precision(PLASMA_enum uplo, int N,
                                                           sequence, &request);
 
   auto duration = std::chrono::high_resolution_clock::now() - start;
-  auto micros =
+  auto t2 = std::chrono::high_resolution_clock::now();
+  const auto micros =
       std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
-
-  long double tflops =
-      (long double)(FLOPS_DPOTRF_ULL(static_cast<unsigned long long>(N))) /
-      micros / 1000000;
+  const long double flops =
+      (long double)(FLOPS_DPOTRF_ULL(static_cast<unsigned long long>(N)));
+  const long double seconds = static_cast<long double>(micros) * 1e-6L;
+  const long double tflops = flops / seconds / 1e12L;
   printf("FLOPS: %Lf\n", tflops);
+
+  const auto tile_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+  const auto factor_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(t2 - start)
+          .count();
+  const auto uncompress_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::high_resolution_clock::now() - t2)
+          .count();
+  std::cout << "[TIMES] tile+quant(us): " << tile_us
+            << ", factor(us): " << factor_us
+            << ", uncompress(us): " << uncompress_us << std::endl;
+
+  const long expected_tiles = (long)array.nt * (array.nt + 1) / 2;
+  std::cout << "[STATS] nt: " << array.nt
+            << ", expected lower tiles: " << expected_tiles
+            << ", pinned tiles: " << g_pinned_tiles
+            << ", pinned bytes: " << g_pinned_bytes
+            << ", quant workspace bytes: " << g_quant_ws_bytes << std::endl;
 
   uncompressMixedPrecisionTiledArray(&array, A, LDA);
   freeMixedPrecisionTiledArray(&array);
@@ -518,12 +756,14 @@ int PLASMA_dpotrf_gpu_reuse_data_table_mixed_precision(PLASMA_enum uplo, int N,
   }
 
   /* Set NT */
-  NB = PLASMA_NB;
+  NB = (plasma->autotuning_enabled ? PLASMA_NB : plasma->nb);
 
   plasma_sequence_create(plasma, &sequence);
 
   MixedPrecisionTiledArray array;
+  auto t0 = std::chrono::high_resolution_clock::now();
   makeMixedPrecisionTiledArray(&array, uplo, A, N, N, LDA, NB);
+  auto t1 = std::chrono::high_resolution_clock::now();
 
   //    if ( PLASMA_TRANSLATION == PLASMA_OUTOFPLACE ) {
   //        plasma_dooplap2tile( descA, A, NB, NB, LDA, N, 0, 0, N, N, sequence,
@@ -541,13 +781,27 @@ int PLASMA_dpotrf_gpu_reuse_data_table_mixed_precision(PLASMA_enum uplo, int N,
       uplo, &array, sequence, &request);
 
   auto duration = std::chrono::high_resolution_clock::now() - start;
-  auto micros =
+  const auto micros =
       std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
-
-  long double tflops =
-      (long double)(FLOPS_DPOTRF_ULL(static_cast<unsigned long long>(N))) /
-      micros / 1000000;
+  const long double flops =
+      (long double)(FLOPS_DPOTRF_ULL(static_cast<unsigned long long>(N)));
+  const long double seconds = static_cast<long double>(micros) * 1e-6L;
+  const long double tflops = flops / seconds / 1e12L;
   printf("FLOPS: %Lf\n", tflops);
+
+  auto t2 = std::chrono::high_resolution_clock::now();
+  const auto tile_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+  const auto factor_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(t2 - start)
+          .count();
+  const auto uncompress_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::high_resolution_clock::now() - t2)
+          .count();
+  std::cout << "[TIMES] tile+quant(us): " << tile_us
+            << ", factor(us): " << factor_us
+            << ", uncompress(us): " << uncompress_us << std::endl;
 
   uncompressMixedPrecisionTiledArray(&array, A, LDA);
   freeMixedPrecisionTiledArray(&array);
@@ -604,12 +858,14 @@ int PLASMA_dpotrf_gpu_reuse_data_table_all_managed_mixed_precision(
   }
 
   /* Set NT */
-  NB = PLASMA_NB;
+  NB = (plasma->autotuning_enabled ? PLASMA_NB : plasma->nb);
 
   plasma_sequence_create(plasma, &sequence);
 
   MixedPrecisionTiledArray array;
+  auto t0 = std::chrono::high_resolution_clock::now();
   makeMixedPrecisionTiledArray(&array, uplo, A, N, N, LDA, NB);
+  auto t1 = std::chrono::high_resolution_clock::now();
 
   //    if ( PLASMA_TRANSLATION == PLASMA_OUTOFPLACE ) {
   //        plasma_dooplap2tile( descA, A, NB, NB, LDA, N, 0, 0, N, N, sequence,
@@ -627,13 +883,27 @@ int PLASMA_dpotrf_gpu_reuse_data_table_all_managed_mixed_precision(
       uplo, &array, sequence, &request);
 
   auto duration = std::chrono::high_resolution_clock::now() - start;
-  auto micros =
+  const auto micros =
       std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
-
-  long double tflops =
-      (long double)(FLOPS_DPOTRF_ULL(static_cast<unsigned long long>(N))) /
-      micros / 1000000;
+  const long double flops =
+      (long double)(FLOPS_DPOTRF_ULL(static_cast<unsigned long long>(N)));
+  const long double seconds = static_cast<long double>(micros) * 1e-6L;
+  const long double tflops = flops / seconds / 1e12L;
   printf("FLOPS: %Lf\n", tflops);
+
+  auto t2 = std::chrono::high_resolution_clock::now();
+  const auto tile_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+  const auto factor_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(t2 - start)
+          .count();
+  const auto uncompress_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::high_resolution_clock::now() - t2)
+          .count();
+  std::cout << "[TIMES] tile+quant(us): " << tile_us
+            << ", factor(us): " << factor_us
+            << ", uncompress(us): " << uncompress_us << std::endl;
 
   uncompressMixedPrecisionTiledArray(&array, A, LDA);
   freeMixedPrecisionTiledArray(&array);

@@ -23,7 +23,7 @@
 #include "context.h"
 #include "plasmatypes.h"
 #include "control.h"
-
+#include <iostream>
 #ifdef __cplusplus
 extern "C" {
 #endif

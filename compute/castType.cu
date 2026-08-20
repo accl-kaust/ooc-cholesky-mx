@@ -6,7 +6,7 @@
 #include <cstdio>
 
 #include "mixed_precision.h"
-
+#include <algorithm>
 template <typename Src, typename Dst>
 __global__ void castKernel(int m, int n, const void *source, int ldSource,
                            void *target, int ldTarget) {
@@ -26,7 +26,7 @@ void *castToBuffer(int m, int n, const void *source, cudaDataType sourceType,
   if (targetType == sourceType) {
     return const_cast<void *>(source);
   }
-  dim3 block{std::min<unsigned int>(256, m * n)};
+  dim3 block{std::min<unsigned int>(256, static_cast<unsigned int>(m * n))};
   dim3 grid{(m * n - 1) / block.x + 1};
   switch (sourceType) {
     case CUDA_R_64F: {

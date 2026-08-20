@@ -25,9 +25,9 @@ __global__ void casting2DRowMajorKernel(int m, int n, const void *from,
   if (rowId >= m || colId >= n) {
     return;
   }
-  reinterpret_cast<To *>(static_cast<std::byte *>(to) + rowId * ldTo)[colId] =
+  reinterpret_cast<To *>(static_cast<uint8_t *>(to) + rowId * ldTo)[colId] =
       static_cast<To>(reinterpret_cast<const From *>(
-          static_cast<const std::byte *>(from) + rowId * ldFrom)[colId]);
+          static_cast<const uint8_t*>(from) + rowId * ldFrom)[colId]);
 }
 
 template <typename From, typename To>
@@ -51,8 +51,8 @@ __global__ void plus2DRowMajorKernel(int m, int n, double beta,
     return;
   }
   auto &fromElement = reinterpret_cast<const From *>(
-      static_cast<const std::byte *>(from) + rowId * ldFrom)[colId];
-  auto &toElement = reinterpret_cast<To *>(static_cast<std::byte *>(to) +
+      static_cast<const uint8_t *>(from) + rowId * ldFrom)[colId];
+  auto &toElement = reinterpret_cast<To *>(static_cast<uint8_t *>(to) +
                                            rowId * ldTo)[colId];
   toElement = static_cast<To>(static_cast<double>(fromElement) +
                               beta * static_cast<double>(toElement));

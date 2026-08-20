@@ -3,3 +3,13 @@
 cmake-build-*
 build
 build_*
+third_party/eigen
+data/*.bin
+
+# run_ladder.sh / ad-hoc test output -- sweep results, not source
+ladder_sweep/
+*sweep_*/
+ablation_test/
+*_underflow_check/
+*_stdout.log
+examples/example_dpotrf_gpu

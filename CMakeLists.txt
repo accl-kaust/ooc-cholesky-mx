@@ -15,6 +15,10 @@ if (NOT ${PLASMA_WITH_MKL} OR NOT ${MKL_FOUND})
     message(STATUS "MKL NOT ENABLED")
     find_package(BLAS REQUIRED)
     find_package(LAPACK REQUIRED)
+    find_library(LAPACKE_LIB lapacke)
+    if (NOT LAPACKE_LIB)
+        message(FATAL_ERROR "lapacke library not found; install liblapacke-dev or enable MKL")
+    endif ()
 endif ()
 
 if (APPLE)
@@ -110,6 +114,7 @@ option(PLASMA_WITH_HPCASIA24 "Reproduce results of HPCASIA'24 paper" ON)
 if (${PLASMA_WITH_HPCASIA24})
     list(APPEND PLASMA_SOURCE
             compute/dpotrf_hpcasia24.cpp
+            compute/mx_emulation.cpp
             compute/dpotrf_mixed_precision.cpp
             compute/pdpotrf_gpu_hpcasia24.cpp
             compute/pdpotrf_gpu_mixed_precision.cpp
@@ -118,8 +123,15 @@ if (${PLASMA_WITH_HPCASIA24})
 endif ()
 
 if (${PLASMA_WITH_CUDA})
-    SET(CMAKE_CUDA_ARCHITECTURES native)
-    find_package(CUDAToolkit)
+    # 80-real/90-real: native SASS for sm_80 (A100) and sm_90 (Hopper/H100),
+    # the architectures this has actually been built and run against.
+    # 90-virtual: PTX for compute_90 embedded alongside them, which the
+    # driver JIT-compiles on any GPU with compute capability >= 9.0 that
+    # doesn't have native SASS here -- Blackwell (sm_100/120) and beyond --
+    # untested so far, but still runs (via JIT on first launch) rather than
+    # hard-failing, without needing a matching -real entry added here.
+    set(CMAKE_CUDA_ARCHITECTURES "80-real;90-real;90-virtual" CACHE STRING "CUDA architectures to build for" FORCE)
+    find_package(CUDAToolkit REQUIRED)
 else ()
     set(CUDAToolkit_FOUND OFF)
 endif ()
@@ -156,7 +168,7 @@ if (${MKL_FOUND})
     target_compile_definitions(plasma PUBLIC $<$<COMPILE_LANGUAGE:C>:PLASMA_WITH_MKL>)
     target_compile_definitions(plasma PUBLIC $<$<COMPILE_LANGUAGE:CXX>:PLASMA_WITH_MKL>)
 else ()
-    target_link_libraries(plasma PUBLIC BLAS::BLAS LAPACK::LAPACK)
+    target_link_libraries(plasma PUBLIC ${LAPACKE_LIB} LAPACK::LAPACK BLAS::BLAS)
 endif ()
 
 if (${PLASMA_WITH_HPCASIA24})

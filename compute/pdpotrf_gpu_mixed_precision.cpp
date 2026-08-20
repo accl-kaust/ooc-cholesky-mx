@@ -21,12 +21,14 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <cuda_runtime.h>
 
 #include "common.h"
 #include "cublasLt.h"
 #include "mixed_kernels.h"
 #include "mixed_precision.h"
 #include "plasma_d_mixed.h"
+#include "mx_tile_copy.h"
 
 namespace {
 
@@ -669,10 +671,11 @@ void plasma_pdpotrf_gpu_reuse_data_table_mixed_precision(
         const auto sizeofTileElement = getSizeofTileElement(tile.dtype);
         if (k == 0) {
           start = get_current_time();
+          auto kindLocal = deduceMemcpyKind(localDestination.get(), A(k, k));
           CHECK_CUDA(cudaMemcpy2DAsync(
               localDestination.get(), ldak * sizeofTileElement, A(k, k),
               ldak * sizeofTileElement, tempkn * sizeofTileElement, tempkn,
-              cudaMemcpyHostToDevice, plasma->cuda_stream[rank]));
+              kindLocal, plasma->cuda_stream[rank]));
           volumeCPU2GPU += ldak * sizeofTileElement * tempkn;
           CHECK_CUDA(cudaStreamSynchronize(plasma->cuda_stream[rank]));
           end = get_current_time();
@@ -704,16 +707,18 @@ void plasma_pdpotrf_gpu_reuse_data_table_mixed_precision(
         end = get_current_time();
         log_event(rank, 0, EVENT_COMPUTE, start, end);
         start = get_current_time();
+        auto kindOut = deduceMemcpyKind(A(k, k), localDestination.get());
         CHECK_CUDA(cudaMemcpy2DAsync(
-            A(k, k), ldak * sizeofTileElement, localDestination.get(),
-            ldak * sizeofTileElement, tempkn * sizeofTileElement, tempkn,
-            cudaMemcpyDeviceToHost, plasma->cuda_stream[rank]));
+          A(k, k), ldak * sizeofTileElement, localDestination.get(),
+          ldak * sizeofTileElement, tempkn * sizeofTileElement, tempkn,
+          kindOut, plasma->cuda_stream[rank]));
         volumeGPU2CPU += ldak * sizeofTileElement * tempkn;
         CHECK_CUDA(cudaMemcpyAsync(&info, infoDevice, sizeof(int),
                                    cudaMemcpyDeviceToHost,
                                    plasma->cuda_stream[rank]));
         volumeGPU2CPU += sizeof(int);
         CHECK_CUDA(cudaStreamSynchronize(plasma->cuda_stream[rank]));
+        requantizeTileHost(&getTile(A, k, k));
         std::unique_lock<std::mutex> lock{dataTable->mutex};
         std::swap(localDestination, dataTable->diagonal);
         dataTable->diagIdx = k;
@@ -734,11 +739,12 @@ void plasma_pdpotrf_gpu_reuse_data_table_mixed_precision(
             getSizeofTileElement(tileLocalDestination.dtype);
         if (n == 0) {
           start = get_current_time();
+          auto kindLocal = deduceMemcpyKind(localDestination.get(), A(k, k));
           CHECK_CUDA(cudaMemcpy2DAsync(
               localDestination.get(), ldak * sizeofTileElementLocalDestination,
               A(k, k), ldak * sizeofTileElementLocalDestination,
-              tempkn * sizeofTileElementLocalDestination, tempkn,
-              cudaMemcpyHostToDevice, plasma->cuda_stream[rank]));
+              tempkn * sizeofTileElementLocalDestination, tempkn, kindLocal,
+              plasma->cuda_stream[rank]));
           volumeCPU2GPU += ldak * sizeofTileElementLocalDestination * tempkn;
           CHECK_CUDA(cudaStreamSynchronize(plasma->cuda_stream[rank]));
           end = get_current_time();
@@ -755,10 +761,11 @@ void plasma_pdpotrf_gpu_reuse_data_table_mixed_precision(
         lock.unlock();
         if (!existA) {
           start = get_current_time();
-          CHECK_CUDA(cudaMemcpy2DAsync(
+            auto kindA = deduceMemcpyKind(bufferA.get(), A(k, n));
+            CHECK_CUDA(cudaMemcpy2DAsync(
               bufferA.get(), ldan * sizeofTileElementBufferA, A(k, n),
               ldan * sizeofTileElementBufferA, A.nb * sizeofTileElementBufferA,
-              tempkn, cudaMemcpyHostToDevice, plasma->cuda_stream[rank]));
+              tempkn, kindA, plasma->cuda_stream[rank]));
           volumeCPU2GPU += ldak * sizeofTileElementBufferA * A.nb;
           CHECK_CUDA(cudaStreamSynchronize(plasma->cuda_stream[rank]));
           *landedA = true;
@@ -808,11 +815,12 @@ void plasma_pdpotrf_gpu_reuse_data_table_mixed_precision(
             getSizeofTileElement(tileLocalDestination.dtype);
         if (k == 0) {
           start = get_current_time();
+          auto kindLocal = deduceMemcpyKind(localDestination.get(), A(m, k));
           CHECK_CUDA(cudaMemcpy2DAsync(
               localDestination.get(), ldak * sizeofTileElementLocalDestination,
               A(m, k), ldak * sizeofTileElementLocalDestination,
-              A.nb * sizeofTileElementLocalDestination, tempmn,
-              cudaMemcpyHostToDevice, plasma->cuda_stream[rank]));
+              A.nb * sizeofTileElementLocalDestination, tempmn, kindLocal,
+              plasma->cuda_stream[rank]));
           volumeCPU2GPU += ldak * sizeofTileElementLocalDestination * A.nb;
           CHECK_CUDA(cudaStreamSynchronize(plasma->cuda_stream[rank]));
           end = get_current_time();
@@ -835,11 +843,12 @@ void plasma_pdpotrf_gpu_reuse_data_table_mixed_precision(
           landed = landedA;
           if (!existA) {
             start = get_current_time();
+            auto kindDiag = deduceMemcpyKind(bufferA.get(), A(k, k));
             CHECK_CUDA(cudaMemcpy2DAsync(
-                bufferA.get(), ldak * sizeofTileElementDiagonal, A(k, k),
-                ldak * sizeofTileElementDiagonal,
-                A.nb * sizeofTileElementDiagonal, A.nb, cudaMemcpyHostToDevice,
-                plasma->cuda_stream[rank]));
+              bufferA.get(), ldak * sizeofTileElementDiagonal, A(k, k),
+              ldak * sizeofTileElementDiagonal,
+              A.nb * sizeofTileElementDiagonal, A.nb, kindDiag,
+              plasma->cuda_stream[rank]));
             volumeCPU2GPU += ldak * sizeofTileElementDiagonal * A.nb;
             CHECK_CUDA(cudaStreamSynchronize(plasma->cuda_stream[rank]));
             *landedA = true;
@@ -881,13 +890,15 @@ void plasma_pdpotrf_gpu_reuse_data_table_mixed_precision(
         end = get_current_time();
         log_event(rank, 0, EVENT_COMPUTE, start, end);
         start = get_current_time();
+        auto kindBack = deduceMemcpyKind(A(m, k), localDestination.get());
         CHECK_CUDA(cudaMemcpy2DAsync(
-            A(m, k), ldak * sizeofTileElementLocalDestination,
-            localDestination.get(), ldak * sizeofTileElementLocalDestination,
-            A.nb * sizeofTileElementLocalDestination, tempmn,
-            cudaMemcpyDeviceToHost, plasma->cuda_stream[rank]));
+          A(m, k), ldak * sizeofTileElementLocalDestination,
+          localDestination.get(), ldak * sizeofTileElementLocalDestination,
+          A.nb * sizeofTileElementLocalDestination, tempmn, kindBack,
+          plasma->cuda_stream[rank]));
         volumeGPU2CPU += ldak * sizeofTileElementLocalDestination * A.nb;
         CHECK_CUDA(cudaStreamSynchronize(plasma->cuda_stream[rank]));
+        requantizeTileHost(&getTile(A, m, k));
         end = get_current_time();
         log_event(rank, 0, EVENT_G2C, start, end);
         ss_cond_set(m, k, 1);
@@ -897,11 +908,12 @@ void plasma_pdpotrf_gpu_reuse_data_table_mixed_precision(
             getSizeofTileElement(tileLocalDestination.dtype);
         if (n == 0) {
           start = get_current_time();
+          auto kindLocal = deduceMemcpyKind(localDestination.get(), A(m, k));
           CHECK_CUDA(cudaMemcpy2DAsync(
               localDestination.get(), ldak * sizeofTileElementLocalDestination,
               A(m, k), ldak * sizeofTileElementLocalDestination,
-              A.nb * sizeofTileElementLocalDestination, tempmn,
-              cudaMemcpyHostToDevice, plasma->cuda_stream[rank]));
+              A.nb * sizeofTileElementLocalDestination, tempmn, kindLocal,
+              plasma->cuda_stream[rank]));
           volumeCPU2GPU += ldak * sizeofTileElementLocalDestination * A.nb;
           CHECK_CUDA(cudaStreamSynchronize(plasma->cuda_stream[rank]));
           end = get_current_time();
@@ -918,10 +930,11 @@ void plasma_pdpotrf_gpu_reuse_data_table_mixed_precision(
         lock.unlock();
         if (!existB) {
           start = get_current_time();
-          CHECK_CUDA(cudaMemcpy2DAsync(
+            auto kindB = deduceMemcpyKind(bufferB.get(), A(k, n));
+            CHECK_CUDA(cudaMemcpy2DAsync(
               bufferB.get(), ldan * sizeofTileElementBufferB, A(k, n),
               ldan * sizeofTileElementBufferB, A.nb * sizeofTileElementBufferB,
-              A.nb, cudaMemcpyHostToDevice, plasma->cuda_stream[rank]));
+              A.nb, kindB, plasma->cuda_stream[rank]));
           volumeCPU2GPU += ldan * sizeofTileElementBufferB * A.nb;
           CHECK_CUDA(cudaStreamSynchronize(plasma->cuda_stream[rank]));
           *landedB = true;
@@ -939,10 +952,11 @@ void plasma_pdpotrf_gpu_reuse_data_table_mixed_precision(
         lock.unlock();
         if (!existC) {
           start = get_current_time();
-          CHECK_CUDA(cudaMemcpy2DAsync(
+            auto kindC = deduceMemcpyKind(bufferC.get(), A(m, n));
+            CHECK_CUDA(cudaMemcpy2DAsync(
               bufferC.get(), ldan * sizeofTileElementBufferC, A(m, n),
               ldan * sizeofTileElementBufferC, A.nb * sizeofTileElementBufferC,
-              tempmn, cudaMemcpyHostToDevice, plasma->cuda_stream[rank]));
+              tempmn, kindC, plasma->cuda_stream[rank]));
           volumeCPU2GPU += ldan * sizeofTileElementBufferC * A.nb;
           CHECK_CUDA(cudaStreamSynchronize(plasma->cuda_stream[rank]));
           *landedC = true;
@@ -1158,10 +1172,11 @@ void plasma_pdpotrf_gpu_reuse_data_table_all_managed_mixed_precision(
         const auto sizeofTileElement = getSizeofTileElement(tile.dtype);
         if (k == 0) {
           start = get_current_time();
+          auto kindLocal = deduceMemcpyKind(localDestination.get(), A(k, k));
           CHECK_CUDA(cudaMemcpy2DAsync(
               localDestination.get(), ldak * sizeofTileElement, A(k, k),
               ldak * sizeofTileElement, tempkn * sizeofTileElement, tempkn,
-              cudaMemcpyHostToDevice, plasma->cuda_stream[rank]));
+              kindLocal, plasma->cuda_stream[rank]));
           volumeCPU2GPU += ldak * sizeofTileElement * tempkn;
           CHECK_CUDA(cudaStreamSynchronize(plasma->cuda_stream[rank]));
           end = get_current_time();
@@ -1193,12 +1208,14 @@ void plasma_pdpotrf_gpu_reuse_data_table_all_managed_mixed_precision(
         end = get_current_time();
         log_event(rank, 0, EVENT_COMPUTE, start, end);
         start = get_current_time();
+        auto kindOut = deduceMemcpyKind(A(k, k), localDestination.get());
         CHECK_CUDA(cudaMemcpy2DAsync(
-            A(k, k), ldak * sizeofTileElement, localDestination.get(),
-            ldak * sizeofTileElement, tempkn * sizeofTileElement, tempkn,
-            cudaMemcpyDeviceToHost, plasma->cuda_stream[rank]));
+          A(k, k), ldak * sizeofTileElement, localDestination.get(),
+          ldak * sizeofTileElement, tempkn * sizeofTileElement, tempkn,
+          kindOut, plasma->cuda_stream[rank]));
         volumeGPU2CPU += ldak * sizeofTileElement * tempkn;
         CHECK_CUDA(cudaStreamSynchronize(plasma->cuda_stream[rank]));
+        requantizeTileHost(&getTile(A, k, k));
         CHECK_CUDA(cudaMemcpyAsync(&info, infoDevice, sizeof(int),
                                    cudaMemcpyDeviceToHost,
                                    plasma->cuda_stream[rank]));
@@ -1232,11 +1249,12 @@ void plasma_pdpotrf_gpu_reuse_data_table_all_managed_mixed_precision(
             getSizeofTileElement(tileLocalDestination.dtype);
         if (n == 0) {
           start = get_current_time();
+          auto kindLocal = deduceMemcpyKind(localDestination.get(), A(k, k));
           CHECK_CUDA(cudaMemcpy2DAsync(
               localDestination.get(), ldak * sizeofTileElementLocalDestination,
               A(k, k), ldak * sizeofTileElementLocalDestination,
-              tempkn * sizeofTileElementLocalDestination, tempkn,
-              cudaMemcpyHostToDevice, plasma->cuda_stream[rank]));
+              tempkn * sizeofTileElementLocalDestination, tempkn, kindLocal,
+              plasma->cuda_stream[rank]));
           volumeCPU2GPU += ldak * sizeofTileElementLocalDestination * tempkn;
           CHECK_CUDA(cudaStreamSynchronize(plasma->cuda_stream[rank]));
           end = get_current_time();
@@ -1253,10 +1271,11 @@ void plasma_pdpotrf_gpu_reuse_data_table_all_managed_mixed_precision(
         lock.unlock();
         if (!existA) {
           start = get_current_time();
-          CHECK_CUDA(cudaMemcpy2DAsync(
+            auto kindA = deduceMemcpyKind(bufferA.get(), A(k, n));
+            CHECK_CUDA(cudaMemcpy2DAsync(
               bufferA.get(), ldan * sizeofTileElementBufferA, A(k, n),
               ldan * sizeofTileElementBufferA, A.nb * sizeofTileElementBufferA,
-              tempkn, cudaMemcpyHostToDevice, plasma->cuda_stream[rank]));
+              tempkn, kindA, plasma->cuda_stream[rank]));
           volumeCPU2GPU += ldak * sizeofTileElementBufferA * A.nb;
           CHECK_CUDA(cudaStreamSynchronize(plasma->cuda_stream[rank]));
           *landedA = true;
@@ -1306,11 +1325,12 @@ void plasma_pdpotrf_gpu_reuse_data_table_all_managed_mixed_precision(
             getSizeofTileElement(tileLocalDestination.dtype);
         if (k == 0) {
           start = get_current_time();
+          auto kindLocal = deduceMemcpyKind(localDestination.get(), A(m, k));
           CHECK_CUDA(cudaMemcpy2DAsync(
               localDestination.get(), ldak * sizeofTileElementLocalDestination,
               A(m, k), ldak * sizeofTileElementLocalDestination,
-              A.nb * sizeofTileElementLocalDestination, tempmn,
-              cudaMemcpyHostToDevice, plasma->cuda_stream[rank]));
+              A.nb * sizeofTileElementLocalDestination, tempmn, kindLocal,
+              plasma->cuda_stream[rank]));
           volumeCPU2GPU += ldak * sizeofTileElementLocalDestination * A.nb;
           CHECK_CUDA(cudaStreamSynchronize(plasma->cuda_stream[rank]));
           end = get_current_time();
@@ -1333,11 +1353,12 @@ void plasma_pdpotrf_gpu_reuse_data_table_all_managed_mixed_precision(
           landed = landedA;
           if (!existA) {
             start = get_current_time();
+            auto kindDiag = deduceMemcpyKind(bufferA.get(), A(k, k));
             CHECK_CUDA(cudaMemcpy2DAsync(
-                bufferA.get(), ldak * sizeofTileElementDiagonal, A(k, k),
-                ldak * sizeofTileElementDiagonal,
-                A.nb * sizeofTileElementDiagonal, A.nb, cudaMemcpyHostToDevice,
-                plasma->cuda_stream[rank]));
+              bufferA.get(), ldak * sizeofTileElementDiagonal, A(k, k),
+              ldak * sizeofTileElementDiagonal,
+              A.nb * sizeofTileElementDiagonal, A.nb, kindDiag,
+              plasma->cuda_stream[rank]));
             volumeCPU2GPU += ldak * sizeofTileElementDiagonal * A.nb;
             CHECK_CUDA(cudaStreamSynchronize(plasma->cuda_stream[rank]));
             *landedA = true;
@@ -1379,13 +1400,15 @@ void plasma_pdpotrf_gpu_reuse_data_table_all_managed_mixed_precision(
         end = get_current_time();
         log_event(rank, 0, EVENT_COMPUTE, start, end);
         start = get_current_time();
+        auto kindBack = deduceMemcpyKind(A(m, k), localDestination.get());
         CHECK_CUDA(cudaMemcpy2DAsync(
-            A(m, k), ldak * sizeofTileElementLocalDestination,
-            localDestination.get(), ldak * sizeofTileElementLocalDestination,
-            A.nb * sizeofTileElementLocalDestination, tempmn,
-            cudaMemcpyDeviceToHost, plasma->cuda_stream[rank]));
+          A(m, k), ldak * sizeofTileElementLocalDestination,
+          localDestination.get(), ldak * sizeofTileElementLocalDestination,
+          A.nb * sizeofTileElementLocalDestination, tempmn, kindBack,
+          plasma->cuda_stream[rank]));
         volumeGPU2CPU += ldak * sizeofTileElementLocalDestination * A.nb;
         CHECK_CUDA(cudaStreamSynchronize(plasma->cuda_stream[rank]));
+        requantizeTileHost(&getTile(A, m, k));
         end = get_current_time();
         log_event(rank, 0, EVENT_G2C, start, end);
         lock.lock();
@@ -1408,11 +1431,12 @@ void plasma_pdpotrf_gpu_reuse_data_table_all_managed_mixed_precision(
             getSizeofTileElement(tileLocalDestination.dtype);
         if (n == 0) {
           start = get_current_time();
+          auto kindLocal = deduceMemcpyKind(localDestination.get(), A(m, k));
           CHECK_CUDA(cudaMemcpy2DAsync(
               localDestination.get(), ldak * sizeofTileElementLocalDestination,
               A(m, k), ldak * sizeofTileElementLocalDestination,
-              A.nb * sizeofTileElementLocalDestination, tempmn,
-              cudaMemcpyHostToDevice, plasma->cuda_stream[rank]));
+              A.nb * sizeofTileElementLocalDestination, tempmn, kindLocal,
+              plasma->cuda_stream[rank]));
           volumeCPU2GPU += ldak * sizeofTileElementLocalDestination * A.nb;
           CHECK_CUDA(cudaStreamSynchronize(plasma->cuda_stream[rank]));
           end = get_current_time();
@@ -1429,10 +1453,11 @@ void plasma_pdpotrf_gpu_reuse_data_table_all_managed_mixed_precision(
         lock.unlock();
         if (!existB) {
           start = get_current_time();
-          CHECK_CUDA(cudaMemcpy2DAsync(
+            auto kindB = deduceMemcpyKind(bufferB.get(), A(k, n));
+            CHECK_CUDA(cudaMemcpy2DAsync(
               bufferB.get(), ldan * sizeofTileElementBufferB, A(k, n),
               ldan * sizeofTileElementBufferB, A.nb * sizeofTileElementBufferB,
-              A.nb, cudaMemcpyHostToDevice, plasma->cuda_stream[rank]));
+              A.nb, kindB, plasma->cuda_stream[rank]));
           volumeCPU2GPU += ldan * sizeofTileElementBufferB * A.nb;
           CHECK_CUDA(cudaStreamSynchronize(plasma->cuda_stream[rank]));
           *landedB = true;
@@ -1450,10 +1475,11 @@ void plasma_pdpotrf_gpu_reuse_data_table_all_managed_mixed_precision(
         lock.unlock();
         if (!existC) {
           start = get_current_time();
-          CHECK_CUDA(cudaMemcpy2DAsync(
+            auto kindC = deduceMemcpyKind(bufferC.get(), A(m, n));
+            CHECK_CUDA(cudaMemcpy2DAsync(
               bufferC.get(), ldan * sizeofTileElementBufferC, A(m, n),
               ldan * sizeofTileElementBufferC, A.nb * sizeofTileElementBufferC,
-              tempmn, cudaMemcpyHostToDevice, plasma->cuda_stream[rank]));
+              tempmn, kindC, plasma->cuda_stream[rank]));
           volumeCPU2GPU += ldan * sizeofTileElementBufferC * A.nb;
           CHECK_CUDA(cudaStreamSynchronize(plasma->cuda_stream[rank]));
           *landedC = true;
