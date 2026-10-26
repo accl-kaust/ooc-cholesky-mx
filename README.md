@@ -127,3 +127,22 @@ Added on top:
   paths, and `CMAKE_CUDA_ARCHITECTURES = "80-real;90-real;90-virtual"`
   (native SASS for A100 and Hopper, plus PTX so newer architectures
   still run via driver JIT).
+
+## Publication
+
+If you use this work, do cite us
+
+```bibtex
+@article{abdurakhmanov2026cholesky,
+  author    = {Abdurauf Abdurakhmanov and Theo Mary and Hatem Ltaief and David E. Keyes and Suhaib A. Fahmy},
+  title     = {Error-Controlled Mixed-Precision {C}holesky Factorization with {MX} Microscaling Formats},
+  journal   = {ACM Transactions on Mathematical Software},
+  year      = {2026},
+  month     = oct,
+  publisher = {ACM},
+  issn      = {0098-3500},
+  doi       = {10.1145/3857919},
+  url       = {https://doi.org/10.1145/3857919},
+  note      = {Just Accepted},
+}
+```
